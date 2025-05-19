@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DDScope WiFi Display</title>
+    <style>
+      html, body {
+        text-align: center;
+        font-family: sans-serif;
+        background-color: #111010;
+        color: rgb(187, 145, 53);
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background-color: #111010;
+        overflow: hidden; /* No scrollbars */
+      }
+
+      canvas {
+        /*border: 1px solid rgb(190, 163, 10);*/
+        display: block;
+        margin: auto;
+        /*
+        width: 100vw;  
+        height: 100vh;  
+        object-fit: contain; 
+        */
+        background-color: black;
+      }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  </head>
+
+  <body>
+    <canvas id="tftCanvas" width="320" height="480"></canvas>
+    <script>
+      const displayWidth = 320;
+      const displayHeight = 480;
+
+      const FRAME_RAW = 0x00;
+      const FRAME_RLE = 0x01;
+      const FRAME_DEFLATE = 0x04;
+
+      const canvas = document.getElementById("tftCanvas");
+      const ctx = canvas.getContext("2d");
+
+      let socket = null;
+      let readState = "HEADER"; // "HEADER" or "BODY"
+      let currentFrame = {
+        type: 0,
+        size: 0,
+        buffer: null,
+        offset: 0,
+      };
+
+      function sendTouch(x, y) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          console.warn("WebSocket not open, cannot send touch.");
+          return;
+        }
+
+        const clickMessage = JSON.stringify({ type: "TOUCH", x, y });
+        socket.send(clickMessage);
+      }
+
+      startWebSocket();
+
+      function startWebSocket() {
+        socket = new WebSocket(`ws://${location.host}/ws`);
+        socket.binaryType = "arraybuffer";
+
+        socket.onopen = () => console.log("WebSocket connected");
+        socket.onclose = () => console.warn("WebSocket closed");
+        socket.onerror = (err) => console.error("WebSocket error", err);
+
+        socket.onmessage = handleSocketMessage;
+      }
+
+      function handleSocketMessage(event) {
+        const incoming = new Uint8Array(event.data);
+
+        // Ignore incoming text packets (e.g., "ack") since we're not using ACKs
+        if (typeof event.data === "string") return;
+
+        let incomingOffset = 0;
+        while (incomingOffset < incoming.length) {
+          if (readState === "HEADER") {
+            if (incoming.length - incomingOffset >= 5) {
+              currentFrame.type = incoming[incomingOffset];
+              currentFrame.size =
+                incoming[incomingOffset + 1] |
+                (incoming[incomingOffset + 2] << 8) |
+                (incoming[incomingOffset + 3] << 16) |
+                (incoming[incomingOffset + 4] << 24);
+              incomingOffset += 5;
+
+              currentFrame.buffer = new Uint8Array(currentFrame.size);
+              currentFrame.offset = 0;
+              currentFrame.partialBuffer = null; // Reset partialBuffer when transitioning to BODY
+
+              console.log(
+                `Received frame header: type=0x${currentFrame.type.toString(
+                  16
+                )}, size=${currentFrame.size}`
+              );
+              readState = "BODY";
+            } else {
+              console.warn(
+                "Not enough data for frame header, buffering remaining data"
+              );
+              const remainingData = incoming.subarray(incomingOffset);
+              if (!currentFrame.partialBuffer) {
+                currentFrame.partialBuffer = remainingData;
+              } else {
+                const combinedBuffer = new Uint8Array(
+                  currentFrame.partialBuffer.length + remainingData.length
+                );
+                combinedBuffer.set(currentFrame.partialBuffer);
+                combinedBuffer.set(
+                  remainingData,
+                  currentFrame.partialBuffer.length
+                );
+                currentFrame.partialBuffer = combinedBuffer;
+              }
+              return; // Exit processing until more data arrives
+            }
+          }
+
+          if (readState === "BODY") {
+            const bytesToCopy = Math.min(
+              currentFrame.size - currentFrame.offset,
+              incoming.length - incomingOffset
+            );
+            currentFrame.buffer.set(
+              incoming.subarray(incomingOffset, incomingOffset + bytesToCopy),
+              currentFrame.offset
+            );
+            currentFrame.offset += bytesToCopy;
+            incomingOffset += bytesToCopy;
+
+            if (currentFrame.offset >= currentFrame.size) {
+              renderFrame(currentFrame.type, currentFrame.buffer.buffer);
+              readState = "HEADER";
+              currentFrame = {
+                type: 0,
+                size: 0,
+                buffer: null,
+                offset: 0,
+              };
+            }
+          }
+        }
+      }
+
+      // Render system
+      function renderFrame(type, buffer) {
+        let imageData;
+
+        try {
+          if (type === FRAME_RAW) {
+            imageData = rawToImageData(buffer);
+          } else if (type === FRAME_RLE) {
+            //console.log("RLE frame received");
+            imageData = RLEToImageData(buffer);
+          } else if (type === FRAME_DEFLATE) {
+            //console.log("DEFLATE frame received");
+            imageData = DeflateToImageData(buffer);
+          } else {
+            console.warn(`Unknown frame type 0x${type.toString(16)}`);
+            return;
+          }
+        } catch (e) {
+          console.error(
+            `Failed to decode frame of type 0x${type.toString(16)} and size ${
+              buffer.byteLength
+            } bytes:`,
+            e
+          );
+          console.error("Failed to decode frame:", e);
+          return;
+        }
+        drawRotated(imageData);
+      }
+
+      function drawRotated(imageData) {
+        const tempCanvas = document.createElement("canvas");
+        const tempCtx = tempCanvas.getContext("2d");
+        tempCanvas.width = 320;
+        tempCanvas.height = 480;
+        tempCtx.putImageData(imageData, 0, 0);
+
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        tempCtx.translate(-canvas.height, 0);
+        tempCtx.rotate(-Math.PI / 2);
+        ctx.drawImage(tempCanvas, 0, 0);
+        ctx.restore();
+      }
+
+      // Decoding functions
+      function DeflateToImageData(deflateBuffer) {
+        try {
+          const compressed = new Uint8Array(deflateBuffer);
+          const decompressed = pako.inflate(compressed, { raw: true });
+          return rawToImageData(decompressed.buffer);
+        } catch (e) {
+          console.error("Deflate decompression failed:", e);
+          return null;
+        }
+      }
+
+      function RLEToImageData(rleBuffer) {
+        const view = new DataView(rleBuffer);
+        const imageData = ctx.createImageData(320, 480);
+        const pixelData = imageData.data;
+
+        let srcIndex = 0;
+        let dstIndex = 0;
+
+        while (srcIndex + 2 < view.byteLength && dstIndex < pixelData.length) {
+          const color565 = view.getUint16(srcIndex, false);
+          srcIndex += 2;
+          const count = view.getUint8(srcIndex++);
+
+          const r = (((color565 >> 11) & 0x1f) * 255) / 31;
+          const g = (((color565 >> 5) & 0x3f) * 255) / 63;
+          const b = ((color565 & 0x1f) * 255) / 31;
+
+          for (let i = 0; i < count && dstIndex + 3 < pixelData.length; i++) {
+            pixelData[dstIndex++] = r;
+            pixelData[dstIndex++] = g;
+            pixelData[dstIndex++] = b;
+            pixelData[dstIndex++] = 255;
+          }
+        }
+        return imageData;
+      }
+
+      function rawToImageData(rawBuffer) {
+        const view = new DataView(rawBuffer);
+        const imageData = ctx.createImageData(320, 480);
+        const pixelData = imageData.data;
+
+        let srcIndex = 0;
+        let dstIndex = 0;
+
+        while (srcIndex < view.byteLength && dstIndex < pixelData.length) {
+          const color565 = view.getUint16(srcIndex, false);
+          srcIndex += 2;
+
+          const r = (((color565 >> 11) & 0x1f) * 255) / 31;
+          const g = (((color565 >> 5) & 0x3f) * 255) / 63;
+          const b = ((color565 & 0x1f) * 255) / 31;
+
+          pixelData[dstIndex++] = r;
+          pixelData[dstIndex++] = g;
+          pixelData[dstIndex++] = b;
+          pixelData[dstIndex++] = 255;
+        }
+        return imageData;
+      }
+
+      canvas.addEventListener("click", (event) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+
+        const scaledX = Math.floor((x / canvas.width) * displayWidth);
+        const scaledY = Math.floor((y / canvas.height) * displayHeight);
+
+        //queueTouch(scaledX, scaledY);
+        sendTouch(scaledX, scaledY);
+      });
+    </script>
+  </body>
+</html>
