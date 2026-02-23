@@ -73,3 +73,8 @@ Various image compression strategies were tested to reduce transfer size:
 ## Summary
 
 This implementation offers a robust and efficient method for mirroring a Teensy-controlled TFT screen over WiFi using an ESP32-S3 and USB communication. The Deflate compression algorithm ensures minimal latency and efficient use of bandwidth while maintaining visual fidelity.
+
+## Book: BUILD A DIRECT DRIVE TELESCOPE: A Comprehensive Guide
+Book Available on Amazon [Here](https://a.co/d/0cUrQWGB) 
+
+<img src="./DDScopeXBookFront.jpg" width="300" alt="DDScopeX Book Front">
